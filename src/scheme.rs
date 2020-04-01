@@ -1,19 +1,26 @@
 use std::collections::BTreeMap;
 use std::convert::{TryFrom, TryInto};
 use std::os::unix::io::AsRawFd;
-use std::{cmp, ops};
+use std::{cmp, ops, time};
 
 use syscall::{Error, EventFlags, Map, Result, SchemeMut, Stat, StatVfs, TimeSpec};
-use syscall::flag::{O_RDWR, O_RDONLY, O_WRONLY, O_DIRECTORY, O_STAT};
+use syscall::flag::{O_CREAT, O_EXCL, O_RDWR, O_RDONLY, O_WRONLY, O_DIRECTORY, O_STAT};
 use syscall::{MODE_DIR, MODE_PERM, MODE_TYPE, SEEK_CUR, SEEK_END, SEEK_SET};
-use syscall::error::{EACCES, EBADF, EBADFD, EFBIG, EINVAL, EISDIR, ENOENT, ENOMEM, ENOSYS, ENOTDIR, EOPNOTSUPP, EOVERFLOW};
+use syscall::error::{EACCES, EBADF, EBADFD, EEXIST, EFBIG, EINVAL, EISDIR, EIO, ENOENT, ENOMEM, ENOSYS, ENOTDIR, ENOTEMPTY, EOPNOTSUPP, EOVERFLOW};
 
-use crate::filesystem::{FileData, Filesystem};
+use crate::filesystem::{DirEntry, File, FileData, Filesystem};
 
 #[derive(Clone)]
 struct Handle {
     inode: usize,
     offset: usize,
+
+    opened_as_read: bool, // opened with O_RDONLY or O_RDWR
+    opened_as_write: bool, // opened with O_WRONLY or O_RDWR
+
+    // the three first bits of mode >> 6 if uid matched, mode >> 3 if gid matched, otherwise mode
+    // >> 0.
+    current_perm: u8,
 }
 
 pub struct Scheme {
@@ -23,6 +30,7 @@ pub struct Scheme {
     filesystem: Filesystem,
 }
 impl Scheme {
+    /// Create the scheme, with the name being used for `fpath`.
     pub fn new(scheme_name: String) -> Result<Self> {
         Ok(Self {
             scheme_name,
@@ -31,33 +39,166 @@ impl Scheme {
             next_fd: 0,
         })
     }
+    /// Remove a directory entry, where the entry can be both a file or a directory. Used by both
+    /// `unlink` and `rmdir`.
+    pub fn remove_dentry(&mut self, path: &[u8], uid: u32, gid: u32, directory: bool) -> Result<usize> {
+        let removed_entry = {
+            let (parent_dir_inode, name_to_delete) = self.filesystem.resolve_except_last(path, uid, gid)?;
+            let parent = self.filesystem.files.get_mut(&parent_dir_inode).ok_or(Error::new(EIO))?;
+
+            let mode = current_perm(parent, uid, gid);
+            if mode & 0o2 != 0 {
+                return Err(Error::new(EACCES));
+            }
+
+            let dentries = parent.data.as_directory_mut().ok_or(Error::new(EBADF))?;
+
+            let (position, entry_inode) = dentries.iter().enumerate().find(|(_, d)| d.name == name_to_delete).unwrap();
+            let entry_inode = entry_inode.inode;
+
+            let removed_entry = dentries.remove(position);
+
+            if let Some(File { data: FileData::Directory(ref data), .. }) = self.filesystem.files.get(&entry_inode) {
+                if !directory {
+                    return Err(Error::new(EISDIR));
+                } else if !data.is_empty() {
+                    return Err(Error::new(ENOTEMPTY));
+                }
+                let parent = self.filesystem.files.get_mut(&parent_dir_inode).ok_or(Error::new(EIO))?;
+                parent.nlink -= 1; // '..' of subdirectory
+            }
+
+            removed_entry
+        };
+
+        let removed_inode = self.filesystem.files.get_mut(&removed_entry.inode).ok_or(Error::new(EIO))?;
+
+        if let FileData::File(_) = removed_inode.data {
+            if directory { return Err(Error::new(EISDIR)) }
+            removed_inode.nlink -= 1; // only the parent entry
+        } else {
+            if !directory { return Err(Error::new(ENOTDIR)) }
+            removed_inode.nlink -= 2; // both the parent entry and '.'
+        }
+
+        if removed_inode.nlink == 0 && removed_inode.open_handles == 0 {
+            self.filesystem.files.remove(&removed_entry.inode);
+        }
+
+        Ok(0)
+    }
+}
+
+pub fn current_time() -> TimeSpec {
+    let sys_time = time::SystemTime::now();
+
+    let duration = match sys_time.duration_since(time::SystemTime::UNIX_EPOCH) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Apparently the signed 32-bit integer has overflowed; the time is now before the Unix epoch...");
+
+            let negative_duration = e.duration();
+
+            return TimeSpec {
+                tv_sec: negative_duration.as_secs().try_into().unwrap_or(i64::min_value()),
+                tv_nsec: negative_duration.subsec_nanos().try_into().unwrap_or(i32::min_value()),
+            };
+        }
+    };
+
+    TimeSpec {
+        tv_sec: duration.as_secs().try_into().unwrap_or(i64::max_value()),
+        tv_nsec: duration.subsec_nanos().try_into().unwrap_or(i32::max_value()),
+    }
 }
 
 impl SchemeMut for Scheme {
     fn open(&mut self, path: &[u8], flags: usize, uid: u32, gid: u32) -> Result<usize> {
-        let inode = self.filesystem.resolve(path, uid, gid).ok_or(Error::new(ENOENT))?;
-        let file = self.filesystem.files.get(&inode).ok_or(Error::new(ENOENT))?;
+        let handle = if flags & O_CREAT != 0 {
+            if flags & O_EXCL != 0 && self.filesystem.resolve(path, 0, 0).is_ok() {
+                return Err(Error::new(EEXIST))
+            }
+            if flags & O_STAT != 0 { return Err(Error::new(EINVAL)) }
 
-        if flags & O_STAT == 0 && flags & O_DIRECTORY != 0 && file.mode & MODE_TYPE != MODE_DIR {
-            return Err(Error::new(ENOTDIR));
-        }
-        if flags & O_STAT == 0 && flags & O_DIRECTORY == 0 && file.mode & MODE_TYPE == MODE_DIR {
-            return Err(Error::new(EISDIR));
-        }
+            let (parent_dir_inode, new_name) = self.filesystem.resolve_except_last(path, uid, gid)?;
 
-        let perm = file.mode & MODE_PERM;
-        
-        if uid == file.uid {
-            check_permissions(flags, (perm & 0o700) >> 6)?;
-        } else if gid == file.gid {
-            check_permissions(flags, (perm & 0o70) >> 3)?;
+            let current_time = current_time();
+
+            let new_inode_number = self.filesystem.next_inode_number()?;
+            let new_inode = if flags & O_DIRECTORY != 0 {
+                File {
+                    atime: current_time,
+                    crtime: current_time,
+                    ctime: current_time,
+                    mtime: current_time,
+                    gid,
+                    uid,
+                    ino: new_inode_number,
+                    mode: 0o755,
+                    nlink: 2, // parent entry, "."
+                    data: FileData::Directory(Vec::new()),
+                    open_handles: 1,
+                }
+            } else {
+                File {
+                    atime: current_time,
+                    crtime: current_time,
+                    ctime: current_time,
+                    mtime: current_time,
+                    gid,
+                    uid,
+                    ino: new_inode_number,
+                    mode: 0o644,
+                    nlink: 1,
+                    data: FileData::File(Vec::new()),
+                    open_handles: 1,
+                }
+            };
+            let current_perm = current_perm(&new_inode, uid, gid);
+            check_permissions(flags, current_perm)?;
+
+            self.filesystem.files.insert(new_inode_number, new_inode);
+
+            let parent_file = self.filesystem.files.get_mut(&parent_dir_inode).ok_or(Error::new(EIO))?;
+            match parent_file.data {
+                FileData::File(_) => return Err(Error::new(EIO)),
+                FileData::Directory(ref mut entries) => entries.push(DirEntry { name: new_name.to_owned(), inode: new_inode_number }),
+            }
+
+            Handle {
+                inode: new_inode_number,
+                offset: 0,
+                opened_as_read: flags & O_RDWR == O_RDONLY || flags & O_RDWR == O_RDWR,
+                opened_as_write: flags & O_RDWR == O_WRONLY || flags & O_RDWR == O_RDWR,
+                current_perm,
+            }
         } else {
-            check_permissions(flags, perm & 0o7)?;
-        }
+            let inode = self.filesystem.resolve(path, uid, gid)?;
+            let file = self.filesystem.files.get_mut(&inode).ok_or(Error::new(ENOENT))?;
 
-        let handle = Handle {
-            inode,
-            offset: 0,
+            if flags & O_STAT == 0 && flags & O_DIRECTORY != 0 && file.mode & MODE_TYPE != MODE_DIR {
+                return Err(Error::new(ENOTDIR));
+            }
+            // Unlike on Linux, which allows directories to be opened without O_DIRECTORY, Redox has no
+            // getdents(2) syscall, and thus it adds the additional restriction that directories have
+            // to be opened with O_DIRECTORY, if they aren't opened with O_STAT to check whether it's a
+            // directory.
+            if flags & O_STAT == 0 && flags & O_DIRECTORY == 0 && file.mode & MODE_TYPE == MODE_DIR {
+                return Err(Error::new(EISDIR));
+            }
+
+            let current_perm = current_perm(file, uid, gid);
+            check_permissions(flags, current_perm)?;
+
+            file.open_handles += 1;
+
+            Handle {
+                inode,
+                offset: 0,
+                opened_as_read: flags & O_RDWR == O_RDONLY || flags & O_RDWR == O_RDWR,
+                opened_as_write: flags & O_RDWR == O_WRONLY || flags & O_RDWR == O_RDWR,
+                current_perm,
+            }
         };
 
         let fd = self.next_fd;
@@ -68,16 +209,23 @@ impl SchemeMut for Scheme {
         Ok(fd)
     }
     fn chmod(&mut self, path: &[u8], mode: u16, uid: u32, gid: u32) -> Result<usize> {
-        // TODO
-        Err(Error::new(ENOSYS))
+        let inode_num = self.filesystem.resolve(path, uid, gid)?;
+        let inode = self.filesystem.files.get_mut(&inode_num).ok_or(Error::new(EIO))?;
+
+        if inode.uid != uid && uid != 0 {
+            return Err(Error::new(EACCES));
+        }
+        if mode & MODE_TYPE != 0 {
+            return Err(Error::new(EINVAL));
+        }
+        inode.mode = mode;
+        Ok(0)
     }
     fn rmdir(&mut self, path: &[u8], uid: u32, gid: u32) -> Result<usize> {
-        // TODO
-        Err(Error::new(ENOSYS))
+        self.remove_dentry(path, uid, gid, true)
     }
     fn unlink(&mut self, path: &[u8], uid: u32, gid: u32) -> Result<usize> {
-        // TODO
-        Err(Error::new(ENOSYS))
+        self.remove_dentry(path, uid, gid, false)
     }
     fn dup(&mut self, old_fd: usize, _buf: &[u8]) -> Result<usize> {
         let handle = self.handles.get_mut(&old_fd).ok_or(Error::new(EBADF))?.clone();
@@ -92,9 +240,12 @@ impl SchemeMut for Scheme {
         let handle = self.handles.get_mut(&fd).ok_or(Error::new(EBADF))?;
         let file = self.filesystem.files.get_mut(&handle.inode).ok_or(Error::new(EBADFD))?;
 
+        if !handle.opened_as_read { return Err(Error::new(EBADF)) }
+
         match file.data {
             FileData::File(ref bytes) => {
                 if file.mode & MODE_TYPE == MODE_DIR { return Err(Error::new(EBADFD)) }
+
                 if handle.offset >= bytes.len() {
                     return Ok(0);
                 }
@@ -104,12 +255,14 @@ impl SchemeMut for Scheme {
             }
             FileData::Directory(ref entries) => {
                 if file.mode & MODE_TYPE != MODE_DIR { return Err(Error::new(EBADFD)) }
+                // directories require the execute permission to be listed
+                if handle.current_perm & 0o1 == 0 { return Err(Error::new(EBADF)) }
 
                 let mut bytes_to_skip = handle.offset;
                 let mut bytes_left_to_read = buf.len();
                 let mut bytes_read = 0;
 
-                for entry_bytes in entries {
+                for DirEntry { name: entry_bytes, .. } in entries {
                     // skip the whole entry if it fits
                     if bytes_to_skip >= entry_bytes.len() {
                         bytes_to_skip -= entry_bytes.len();
@@ -167,7 +320,10 @@ impl SchemeMut for Scheme {
         let handle = self.handles.get_mut(&fd).ok_or(Error::new(EBADF))?;
         let file = self.filesystem.files.get_mut(&handle.inode).ok_or(Error::new(EBADFD))?;
 
-        // TODO: Check that no file becomes a directory etc.
+        if mode & MODE_TYPE != 0 {
+            return Err(Error::new(EINVAL));
+        }
+
         file.mode = mode;
 
         Ok(0)
@@ -295,8 +451,13 @@ impl SchemeMut for Scheme {
         Ok(0)
     }
     fn close(&mut self, fd: usize) -> Result<usize> {
-        if self.handles.remove(&fd).is_none() {
-            return Err(Error::new(EBADF));
+        let inode_num = self.handles.remove(&fd).ok_or(Error::new(EBADF))?.inode;
+        let inode = self.filesystem.files.get_mut(&inode_num).ok_or(Error::new(EIO))?;
+
+        inode.open_handles -= 1;
+
+        if inode.nlink == 0 && inode.open_handles == 0 {
+            self.filesystem.files.remove(&inode_num);
         }
         Ok(0)
     }
@@ -307,7 +468,21 @@ where
 {
     (numer + (denom - T::from(1u8))) / denom
 }
-fn check_permissions(flags: usize, single_mode: u16) -> Result<()> {
+pub fn current_perm(file: &crate::filesystem::File, uid: u32, gid: u32) -> u8 {
+    let perm = file.mode & MODE_PERM;
+
+    if uid == 0 {
+        // root doesn't have to be checked
+        0o7
+    } else if uid == file.uid {
+        ((perm & 0o700) >> 6) as u8
+    } else if gid == file.gid {
+        ((perm & 0o70) >> 3) as u8
+    } else {
+        (perm & 0o7) as u8
+    }
+}
+fn check_permissions(flags: usize, single_mode: u8) -> Result<()> {
     if flags & O_RDWR == O_RDONLY && single_mode & 0o4 == 0 {
         return Err(Error::new(EACCES));
     } else if flags & O_RDWR == O_WRONLY && single_mode & 0o2 == 0 {
