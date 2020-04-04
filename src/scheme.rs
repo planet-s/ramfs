@@ -1,14 +1,14 @@
 use std::collections::BTreeMap;
 use std::convert::{TryFrom, TryInto};
 use std::os::unix::io::AsRawFd;
-use std::{cmp, ops, time};
+use std::{cmp, ops};
 
 use syscall::{Error, EventFlags, Map, Result, SchemeMut, Stat, StatVfs, TimeSpec};
-use syscall::flag::{O_CREAT, O_EXCL, O_RDWR, O_RDONLY, O_WRONLY, O_DIRECTORY, O_STAT};
-use syscall::{MODE_DIR, MODE_PERM, MODE_TYPE, SEEK_CUR, SEEK_END, SEEK_SET};
-use syscall::error::{EACCES, EBADF, EBADFD, EEXIST, EFBIG, EINVAL, EISDIR, EIO, ENOENT, ENOMEM, ENOSYS, ENOTDIR, ENOTEMPTY, EOPNOTSUPP, EOVERFLOW};
+use syscall::flag::{O_ACCMODE, O_CREAT, O_EXCL, O_RDWR, O_RDONLY, O_WRONLY, O_DIRECTORY, O_STAT};
+use syscall::{MODE_FILE, MODE_DIR, MODE_PERM, MODE_TYPE, SEEK_CUR, SEEK_END, SEEK_SET};
+use syscall::error::{EACCES, EBADF, EBADFD, EEXIST, EINVAL, EISDIR, EIO, ENOMEM, ENOSYS, ENOTDIR, ENOTEMPTY, EOVERFLOW};
 
-use crate::filesystem::{DirEntry, File, FileData, Filesystem};
+use crate::filesystem::{self, DirEntry, File, FileData, Filesystem};
 
 #[derive(Clone)]
 struct Handle {
@@ -44,10 +44,11 @@ impl Scheme {
     pub fn remove_dentry(&mut self, path: &[u8], uid: u32, gid: u32, directory: bool) -> Result<usize> {
         let removed_entry = {
             let (parent_dir_inode, name_to_delete) = self.filesystem.resolve_except_last(path, uid, gid)?;
+            let name_to_delete = name_to_delete.ok_or(Error::new(EINVAL))?; // can't remove root
             let parent = self.filesystem.files.get_mut(&parent_dir_inode).ok_or(Error::new(EIO))?;
 
             let mode = current_perm(parent, uid, gid);
-            if mode & 0o2 != 0 {
+            if mode & 0o2 == 0 {
                 return Err(Error::new(EACCES));
             }
 
@@ -89,43 +90,27 @@ impl Scheme {
     }
 }
 
-pub fn current_time() -> TimeSpec {
-    let sys_time = time::SystemTime::now();
-
-    let duration = match sys_time.duration_since(time::SystemTime::UNIX_EPOCH) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Apparently the signed 32-bit integer has overflowed; the time is now before the Unix epoch...");
-
-            let negative_duration = e.duration();
-
-            return TimeSpec {
-                tv_sec: negative_duration.as_secs().try_into().unwrap_or(i64::min_value()),
-                tv_nsec: negative_duration.subsec_nanos().try_into().unwrap_or(i32::min_value()),
-            };
-        }
-    };
-
-    TimeSpec {
-        tv_sec: duration.as_secs().try_into().unwrap_or(i64::max_value()),
-        tv_nsec: duration.subsec_nanos().try_into().unwrap_or(i32::max_value()),
-    }
-}
-
 impl SchemeMut for Scheme {
     fn open(&mut self, path: &[u8], flags: usize, uid: u32, gid: u32) -> Result<usize> {
         let handle = if flags & O_CREAT != 0 {
             if flags & O_EXCL != 0 && self.filesystem.resolve(path, 0, 0).is_ok() {
-                return Err(Error::new(EEXIST))
+                return Err(Error::new(EEXIST));
             }
             if flags & O_STAT != 0 { return Err(Error::new(EINVAL)) }
 
             let (parent_dir_inode, new_name) = self.filesystem.resolve_except_last(path, uid, gid)?;
+            let new_name = new_name.ok_or(Error::new(EINVAL))?; // cannot mkdir /
 
-            let current_time = current_time();
+            let current_time = filesystem::current_time();
 
             let new_inode_number = self.filesystem.next_inode_number()?;
+
+            let mut mode = (flags & 0xFFFF) as u16;
+
             let new_inode = if flags & O_DIRECTORY != 0 {
+                if mode & MODE_TYPE == 0 { mode |= MODE_DIR }
+                if mode & MODE_TYPE != MODE_DIR { return Err(Error::new(EINVAL)) }
+
                 File {
                     atime: current_time,
                     crtime: current_time,
@@ -134,12 +119,15 @@ impl SchemeMut for Scheme {
                     gid,
                     uid,
                     ino: new_inode_number,
-                    mode: 0o755,
+                    mode,
                     nlink: 2, // parent entry, "."
                     data: FileData::Directory(Vec::new()),
                     open_handles: 1,
                 }
             } else {
+                if mode & MODE_TYPE == 0 { mode |= MODE_FILE }
+                if mode & MODE_TYPE == MODE_DIR { return Err(Error::new(EINVAL)) }
+
                 File {
                     atime: current_time,
                     crtime: current_time,
@@ -148,7 +136,7 @@ impl SchemeMut for Scheme {
                     gid,
                     uid,
                     ino: new_inode_number,
-                    mode: 0o644,
+                    mode,
                     nlink: 1,
                     data: FileData::File(Vec::new()),
                     open_handles: 1,
@@ -168,14 +156,13 @@ impl SchemeMut for Scheme {
             Handle {
                 inode: new_inode_number,
                 offset: 0,
-                opened_as_read: flags & O_RDWR == O_RDONLY || flags & O_RDWR == O_RDWR,
-                opened_as_write: flags & O_RDWR == O_WRONLY || flags & O_RDWR == O_RDWR,
+                opened_as_read: flags & O_ACCMODE == O_RDONLY || flags & O_ACCMODE == O_RDWR,
+                opened_as_write: flags & O_ACCMODE == O_WRONLY || flags & O_ACCMODE == O_RDWR,
                 current_perm,
             }
         } else {
             let inode = self.filesystem.resolve(path, uid, gid)?;
-            let file = self.filesystem.files.get_mut(&inode).ok_or(Error::new(ENOENT))?;
-
+            let file = self.filesystem.files.get_mut(&inode).ok_or(Error::new(EIO))?;
             if flags & O_STAT == 0 && flags & O_DIRECTORY != 0 && file.mode & MODE_TYPE != MODE_DIR {
                 return Err(Error::new(ENOTDIR));
             }
@@ -195,8 +182,8 @@ impl SchemeMut for Scheme {
             Handle {
                 inode,
                 offset: 0,
-                opened_as_read: flags & O_RDWR == O_RDONLY || flags & O_RDWR == O_RDWR,
-                opened_as_write: flags & O_RDWR == O_WRONLY || flags & O_RDWR == O_RDWR,
+                opened_as_read: flags & O_ACCMODE == O_RDONLY || flags & O_ACCMODE == O_RDWR,
+                opened_as_write: flags & O_ACCMODE == O_WRONLY || flags & O_ACCMODE == O_RDWR,
                 current_perm,
             }
         };
@@ -212,13 +199,15 @@ impl SchemeMut for Scheme {
         let inode_num = self.filesystem.resolve(path, uid, gid)?;
         let inode = self.filesystem.files.get_mut(&inode_num).ok_or(Error::new(EIO))?;
 
+        let cur_mode = inode.mode & MODE_TYPE;
+
         if inode.uid != uid && uid != 0 {
             return Err(Error::new(EACCES));
         }
         if mode & MODE_TYPE != 0 {
             return Err(Error::new(EINVAL));
         }
-        inode.mode = mode;
+        inode.mode = mode | cur_mode;
         Ok(0)
     }
     fn rmdir(&mut self, path: &[u8], uid: u32, gid: u32) -> Result<usize> {
@@ -251,6 +240,7 @@ impl SchemeMut for Scheme {
                 }
                 let bytes_to_read = cmp::min(bytes.len(), buf.len() + handle.offset) - handle.offset;
                 buf[..bytes_to_read].copy_from_slice(&bytes[handle.offset..handle.offset + bytes_to_read]);
+                handle.offset += bytes_to_read;
                 Ok(bytes_to_read)
             }
             FileData::Directory(ref entries) => {
@@ -269,14 +259,16 @@ impl SchemeMut for Scheme {
                         continue;
                     }
 
-                    let bytes_to_read = cmp::min(entry_bytes.len() - bytes_to_skip, bytes_left_to_read);
+                    let bytes_to_read = cmp::min(entry_bytes.len() + 1 - bytes_to_skip, bytes_left_to_read);
 
-                    let entry_bytes = &entry_bytes[bytes_to_skip..bytes_to_skip + bytes_to_read];
+                    let entry_bytes = &entry_bytes[bytes_to_skip..bytes_to_skip + bytes_to_read - 1];
                     bytes_to_skip -= bytes_to_skip;
 
-                    buf[handle.offset..handle.offset + bytes_to_read].copy_from_slice(&entry_bytes[..bytes_to_read]);
+                    buf[bytes_read..bytes_read + bytes_to_read - 1].copy_from_slice(&entry_bytes[..bytes_to_read - 1]);
+                    buf[bytes_read + bytes_to_read - 1] = b'\n';
                     bytes_left_to_read -= bytes_to_read;
                     bytes_read += bytes_to_read;
+                    handle.offset += bytes_read;
                 }
                 Ok(bytes_read)
             }
@@ -308,6 +300,7 @@ impl SchemeMut for Scheme {
         // cast to isize, possibly making the offset negative
         let pos = pos as isize;
 
+        let old = handle.offset;
         handle.offset = match whence {
             SEEK_SET => cmp::max(0, pos) as usize,
             SEEK_CUR => cmp::max(0, pos + isize::try_from(handle.offset).or(Err(Error::new(EOVERFLOW)))?) as usize,
@@ -320,11 +313,13 @@ impl SchemeMut for Scheme {
         let handle = self.handles.get_mut(&fd).ok_or(Error::new(EBADF))?;
         let file = self.filesystem.files.get_mut(&handle.inode).ok_or(Error::new(EBADFD))?;
 
+        let cur_type = file.mode & MODE_TYPE;
+
         if mode & MODE_TYPE != 0 {
             return Err(Error::new(EINVAL));
         }
 
-        file.mode = mode;
+        file.mode = mode | cur_type;
 
         Ok(0)
     }
@@ -379,6 +374,8 @@ impl SchemeMut for Scheme {
         let block_size = self.filesystem.block_size();
         let file = self.filesystem.files.get_mut(&handle.inode).ok_or(Error::new(EBADFD))?;
 
+        let size = file.data.size().try_into().or(Err(Error::new(EOVERFLOW)))?;
+
         *stat = Stat {
             st_mode: file.mode,
             st_uid: file.uid,
@@ -387,9 +384,9 @@ impl SchemeMut for Scheme {
             st_nlink: file.nlink.try_into().or(Err(Error::new(EOVERFLOW)))?,
             st_dev: 0,
 
-            st_size: file.data.size().try_into().or(Err(Error::new(EOVERFLOW)))?,
+            st_size: size,
             st_blksize: block_size,
-            st_blocks: div_round_up(stat.st_size, u64::from(stat.st_blksize)),
+            st_blocks: div_round_up(size, u64::from(block_size)),
 
             st_atime: file.atime.tv_sec.try_into().or(Err(Error::new(EOVERFLOW)))?,
             st_atime_nsec: file.atime.tv_nsec.try_into().or(Err(Error::new(EOVERFLOW)))?,
@@ -483,11 +480,11 @@ pub fn current_perm(file: &crate::filesystem::File, uid: u32, gid: u32) -> u8 {
     }
 }
 fn check_permissions(flags: usize, single_mode: u8) -> Result<()> {
-    if flags & O_RDWR == O_RDONLY && single_mode & 0o4 == 0 {
+    if flags & O_ACCMODE == O_RDONLY && single_mode & 0o4 == 0 {
         return Err(Error::new(EACCES));
-    } else if flags & O_RDWR == O_WRONLY && single_mode & 0o2 == 0 {
+    } else if flags & O_ACCMODE == O_WRONLY && single_mode & 0o2 == 0 {
         return Err(Error::new(EACCES));
-    } else if flags & O_RDWR == O_RDWR && single_mode & 0o6 != 0o6 {
+    } else if flags & O_ACCMODE == O_RDWR && single_mode & 0o6 != 0o6 {
         return Err(Error::new(EACCES));
     }
     Ok(())

@@ -1,18 +1,18 @@
 use std::collections::BTreeMap;
+use std::convert::TryInto;
 use std::ffi::OsStr;
-use std::fs;
+use std::{iter, fs, time};
 
 use std::os::unix::io::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 
-use bstr::ByteSlice;
-
-use syscall::{Error, Result, StatVfs, TimeSpec};
+use syscall::{Error, Result, StatVfs, TimeSpec, MODE_DIR};
 use syscall::error::{EACCES, EIO, ENFILE, ENOENT};
 use syscall::flag::{O_RDONLY, O_STAT};
 
 use super::scheme::current_perm;
 
+#[derive(Debug)]
 pub struct File {
     pub mode: u16,
     pub uid: u32,
@@ -30,11 +30,13 @@ pub struct File {
     pub data: FileData,
 }
 
+#[derive(Clone, Debug)]
 pub struct DirEntry {
     pub name: Vec<u8>,
     pub inode: usize,
 }
 
+#[derive(Debug)]
 pub enum FileData {
     File(Vec<u8>),
     Directory(Vec<DirEntry>),
@@ -71,10 +73,29 @@ impl Filesystem {
 
     pub fn new() -> Result<Self> {
         Ok(Self {
-            files: BTreeMap::new(),
+            files: iter::once((Self::ROOT_INODE, Self::create_root_inode())).collect(),
             memory_file: fs::File::open("memory:").or(Err(Error::new(EIO)))?,
             last_inode_number: Self::ROOT_INODE,
         })
+    }
+    fn create_root_inode() -> File {
+        let cur_time = current_time();
+        File {
+            atime: cur_time,
+            crtime: cur_time,
+            ctime: cur_time,
+            mtime: cur_time,
+
+            mode: MODE_DIR | 0o755,
+            ino: Self::ROOT_INODE,
+            nlink: 1,
+            open_handles: 0,
+
+            uid: 0,
+            gid: 0,
+
+            data: FileData::Directory(Vec::new()),
+        }
     }
     pub fn get_block_size(&self) -> Result<u32> {
         let mut statvfs = StatVfs::default();
@@ -89,13 +110,19 @@ impl Filesystem {
         self.last_inode_number = next;
         Ok(next)
     }
-    fn resolve_generic(&self, parts: Vec<&[u8]>, uid: u32, gid: u32) -> Result<usize> {
+    fn resolve_generic(&self, mut parts: Vec<&[u8]>, uid: u32, gid: u32) -> Result<usize> {
         let mut current_file = self.files.get(&Self::ROOT_INODE).ok_or(Error::new(ENOENT))?;
+        dbg!();
         let mut current_inode = Self::ROOT_INODE;
 
         let mut i = 0;
 
-        while let Some(part) = parts.get(i) {
+        loop {
+            let part = match parts.get(i) {
+                Some(p) => p,
+                None => break,
+            };
+            dbg!(current_inode, part);
             let dentries = match current_file.data {
                 FileData::Directory(ref dentries) => dentries,
                 FileData::File(_) => return Err(Error::new(ENOENT)),
@@ -106,12 +133,15 @@ impl Filesystem {
             if part == b"." || part == b".." {
                 parts.remove(i);
             }
+
+            let part = parts.get(i).unwrap();
             if part == b".." {
                 if i > 0 {
                     i -= 1;
                     parts.remove(i);
                 }
             }
+            let part = parts.get(i).unwrap();
 
             let entry = dentries.iter().find(|dentry| &dentry.name == part).ok_or(Error::new(ENOENT))?;
             current_file = self.files.get(&entry.inode).ok_or(Error::new(EIO))?;
@@ -121,10 +151,15 @@ impl Filesystem {
         }
         Ok(current_inode)
     }
-    pub fn resolve_except_last<'a>(&self, mut path_bytes: &'a [u8], uid: u32, gid: u32) -> Result<(usize, &'a [u8])> {
+    pub fn resolve_except_last<'a>(&self, mut path_bytes: &'a [u8], uid: u32, gid: u32) -> Result<(usize, Option<&'a [u8]>)> {
         if path_bytes.first() == Some(&b'/') { path_bytes = &path_bytes[1..] }
-        let parts = path_components_iter(path_bytes).collect::<Vec<_>>();
-        let last = parts.pop().ok_or(Error::new(ENOENT))?;
+        let mut parts = path_components_iter(path_bytes).collect::<Vec<_>>();
+
+        let last = if parts.len() >= 1 {
+            Some(parts.pop().unwrap())
+        } else {
+            None
+        };
 
         Ok((self.resolve_generic(parts, uid, gid)?, last))
     }
@@ -138,4 +173,26 @@ impl Filesystem {
 pub fn path_components_iter(bytes: &[u8]) -> impl Iterator<Item = &[u8]> + '_ {
     let components_iter = bytes.split(|c| c == &b'/');
     components_iter.filter(|item| !item.is_empty())
+}
+pub fn current_time() -> TimeSpec {
+    let sys_time = time::SystemTime::now();
+
+    let duration = match sys_time.duration_since(time::SystemTime::UNIX_EPOCH) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Apparently the signed 32-bit integer has overflowed; the time is now before the Unix epoch...");
+
+            let negative_duration = e.duration();
+
+            return TimeSpec {
+                tv_sec: negative_duration.as_secs().try_into().unwrap_or(i64::min_value()),
+                tv_nsec: negative_duration.subsec_nanos().try_into().unwrap_or(i32::min_value()),
+            };
+        }
+    };
+
+    TimeSpec {
+        tv_sec: duration.as_secs().try_into().unwrap_or(i64::max_value()),
+        tv_nsec: duration.subsec_nanos().try_into().unwrap_or(i32::max_value()),
+    }
 }
