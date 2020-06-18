@@ -112,7 +112,6 @@ impl Filesystem {
     }
     fn resolve_generic(&self, mut parts: Vec<&[u8]>, uid: u32, gid: u32) -> Result<usize> {
         let mut current_file = self.files.get(&Self::ROOT_INODE).ok_or(Error::new(ENOENT))?;
-        dbg!();
         let mut current_inode = Self::ROOT_INODE;
 
         let mut i = 0;
@@ -122,7 +121,6 @@ impl Filesystem {
                 Some(p) => p,
                 None => break,
             };
-            dbg!(current_inode, part);
             let dentries = match current_file.data {
                 FileData::Directory(ref dentries) => dentries,
                 FileData::File(_) => return Err(Error::new(ENOENT)),
