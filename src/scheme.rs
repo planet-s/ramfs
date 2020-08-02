@@ -293,21 +293,18 @@ impl SchemeMut for Scheme {
             Err(Error::new(EISDIR))
         }
     }
-    fn seek(&mut self, fd: usize, pos: usize, whence: usize) -> Result<usize> {
+    fn seek(&mut self, fd: usize, pos: isize, whence: usize) -> Result<isize> {
         let handle = self.handles.get_mut(&fd).ok_or(Error::new(EBADF))?;
         let file = self.filesystem.files.get_mut(&handle.inode).ok_or(Error::new(EBADFD))?;
 
-        // cast to isize, possibly making the offset negative
-        let pos = pos as isize;
-
         let old = handle.offset;
         handle.offset = match whence {
-            SEEK_SET => cmp::max(0, pos) as usize,
-            SEEK_CUR => cmp::max(0, pos + isize::try_from(handle.offset).or(Err(Error::new(EOVERFLOW)))?) as usize,
-            SEEK_END => cmp::max(0, pos + isize::try_from(file.data.size()).or(Err(Error::new(EOVERFLOW)))?) as usize,
+            SEEK_SET => cmp::max(0, pos),
+            SEEK_CUR => cmp::max(0, pos + isize::try_from(handle.offset).or(Err(Error::new(EOVERFLOW)))?),
+            SEEK_END => cmp::max(0, pos + isize::try_from(file.data.size()).or(Err(Error::new(EOVERFLOW)))?),
             _ => return Err(Error::new(EINVAL)),
-        };
-        Ok(handle.offset)
+        } as usize;
+        Ok(handle.offset as isize)
     }
     fn fchmod(&mut self, fd: usize, mode: u16) -> Result<usize> {
         let handle = self.handles.get_mut(&fd).ok_or(Error::new(EBADF))?;
