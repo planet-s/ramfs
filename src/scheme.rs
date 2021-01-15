@@ -348,7 +348,7 @@ impl SchemeMut for Scheme {
         // TODO
         Err(Error::new(ENOSYS))
     }
-    fn funmap(&mut self, _address: usize) -> Result<usize> {
+    fn funmap(&mut self, _address: usize, _len: usize) -> Result<usize> {
         // TODO
         Err(Error::new(ENOSYS))
     }
